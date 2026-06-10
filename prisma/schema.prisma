@@ -1,0 +1,390 @@
+// VEIL — consent + rights protocol for synthetic likeness.
+//
+// LICENSE-ONLY by construction. This schema models WHO may use a likeness, for
+// WHAT, WHERE, WHEN, and UNDER WHAT TERMS — and the tamper-evident record of
+// those decisions. It stores no generative model and no raw media: likeness is
+// referenced by content hash only (see LikenessAsset.referenceHash).
+//
+// DEFAULT-DENY is enforced in the service layer, but the schema is built so it
+// is *expressible*: a Grant carries no implicit permissions — every scope field
+// (useTypes, territory, window, exclusivity, targeting) is required and explicit.
+// Nothing is permitted unless a live, in-scope Grant says so.
+
+generator client {
+  // Prisma 7 Rust-free client. `output` is required; the generated client is
+  // gitignored and regenerated on install/build (see package.json `build`).
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  // Prisma 7: connection URLs live in prisma.config.ts (CLI/migrations) and in
+  // the driver adapter at runtime — not here. The block declares only the
+  // provider.
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Marquee talent are represented and onboarded white-glove; self-serve holders
+/// act for themselves. The tier gates which verification path and which
+/// authority basis applies.
+enum PersonTier {
+  MARQUEE
+  SELF_SERVE
+}
+
+enum VerificationProvider {
+  SUMSUB // third-party identity verification
+  REP_SIGNOFF // a representative attests on the person's behalf (marquee)
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+  EXPIRED
+}
+
+/// Modality is deliberately open-ended from day one so the protocol is not
+/// face-only: voice, full video performance, and future modalities are
+/// first-class. OTHER is the forward escape hatch until a modality earns its
+/// own enum member.
+enum Modality {
+  FACE
+  VOICE
+  VIDEO_PERFORMANCE
+  OTHER
+}
+
+enum LicenseeVerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+  SUSPENDED
+}
+
+/// Permitted use categories. Stored as an ENUM ARRAY on Grant (Grant.useTypes),
+/// not an opaque Json scope blob: default-deny is a set-membership test
+/// (requested use ∈ useTypes) — type-safe and queryable here. Finer per-use
+/// constraints, when concrete, belong in a future relational table, never in
+/// Json.
+enum UseType {
+  ADVERTISING
+  VOICE_SYNTHESIS
+  FILM_DOUBLE
+  POSTHUMOUS
+  OTHER
+}
+
+/// NON_EXCLUSIVE: others may also be granted the same scope.
+/// EXCLUSIVE: only this grant's licensee may exercise the scope.
+/// SOLE: like EXCLUSIVE, and the holder themselves will not exercise it either.
+enum Exclusivity {
+  NON_EXCLUSIVE
+  EXCLUSIVE
+  SOLE
+}
+
+enum Currency {
+  USD
+  GBP
+  EUR
+}
+
+enum GrantStatus {
+  DRAFT
+  ACTIVE
+  EXPIRED
+  REVOKED
+}
+
+enum LicenseInstanceStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+  REVOKED
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Identity & likeness (supply side)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The party with contractual authority to bind a marquee Person (agent, firm,
+/// estate for posthumous). authorityRef is an opaque reference to the instrument
+/// proving that authority — not the document itself.
+model Representative {
+  id           String   @id @default(cuid())
+  name         String
+  firm         String
+  authorityRef String
+  persons      Person[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+/// A verified likeness holder.
+model Person {
+  id          String     @id @default(cuid())
+  displayName String
+  tier        PersonTier
+
+  // MARQUEE persons link to a Representative; SELF_SERVE persons do not. Kept
+  // nullable so both tiers share one table — the tier↔representative invariant
+  // (marquee ⇒ representative present) is enforced in the service layer.
+  representativeId String?
+  representative   Representative? @relation(fields: [representativeId], references: [id], onDelete: Restrict)
+
+  verifications IdentityVerification[]
+  assets        LikenessAsset[]
+  grants        Grant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([representativeId])
+  @@index([tier])
+}
+
+model IdentityVerification {
+  id       String @id @default(cuid())
+  personId String
+  person   Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  provider VerificationProvider
+  status   VerificationStatus   @default(PENDING)
+
+  // Opaque pointer to the evidence (Sumsub applicant id, signed sign-off hash).
+  // Never the raw PII/evidence.
+  evidenceRef String?
+  verifiedAt  DateTime?
+  expiresAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([personId])
+  @@index([status])
+}
+
+/// A referenced likeness belonging to a Person. Modality-agnostic.
+model LikenessAsset {
+  id       String @id @default(cuid())
+  personId String
+  person   Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  modality Modality
+
+  // Content-addressed reference (e.g. a perceptual/cryptographic hash of the
+  // enrolled face or voice print). A REFERENCE for matching and provenance —
+  // VEIL stores no generative model and no raw media. License-only.
+  referenceHash String
+
+  // Modality-specific descriptors (sample rate, capture context, etc).
+  // Non-authoritative; scope decisions never read free-form metadata.
+  metadata Json @default("{}")
+
+  grantLinks GrantAsset[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([personId])
+  @@index([modality])
+  @@index([referenceHash])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Demand side
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A demand-side organisation that licenses likeness.
+model Licensee {
+  id           String                     @id @default(cuid())
+  orgName      String
+  contactName  String?
+  contactEmail String
+  status       LicenseeVerificationStatus @default(UNVERIFIED)
+
+  // Grants targeted at this licensee (the nullable Grant.licenseeId side).
+  targetedGrants Grant[]
+  licenses       LicenseInstance[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Grant — the core authorization object
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Grant {
+  id       String @id @default(cuid())
+  personId String
+  person   Person @relation(fields: [personId], references: [id], onDelete: Restrict)
+
+  // Assets this grant authorizes — many-to-many via GrantAsset.
+  assets GrantAsset[]
+
+  // SCOPE — all fields required; no implicit permissions.
+
+  // Permitted use categories as an enum array: default-deny is the membership
+  // test (requested use ∈ useTypes). Type-safe and queryable (array containment)
+  // for revocation sweeps and registry filtering. NOT an opaque Json blob.
+  useTypes UseType[]
+
+  // ISO 3166-1 alpha-2 region codes, with the sentinel "WORLDWIDE" for
+  // unrestricted. An array because real deals are multi-region ("GB","IE") from
+  // day one — same shape rationale as useTypes.
+  territory String[]
+
+  startsAt DateTime
+  endsAt   DateTime
+
+  // Price in micros (millionths of a currency unit). BigInt: a seven-figure deal
+  // in micros overflows Int32.
+  priceMicros BigInt
+  currency    Currency
+
+  // Exclusivity is first-class — conflicting-ACTIVE-grant detection is an
+  // enforcement-core concern and the likeliest marquee dispute. Cannot be bolted
+  // on later without re-evaluating every existing grant.
+  exclusivity Exclusivity @default(NON_EXCLUSIVE)
+
+  // Targeting is part of SCOPE, not a LicenseInstance-time detail. A bilaterally
+  // negotiated grant is scoped to one party (licenseeId set); null is an OPEN
+  // standing offer (the self-serve path). Service-layer rule: null still requires
+  // a VERIFIED licensee at instantiation — null means "any verified licensee",
+  // never "no checks".
+  licenseeId String?
+  licensee   Licensee? @relation(fields: [licenseeId], references: [id], onDelete: Restrict)
+
+  // Structured negative space — uses/contexts forbidden even when otherwise in
+  // scope (political, adult, defamatory, …). Json because exclusions are
+  // open-ended, and because they only ever NARROW permissions an opaque value
+  // here cannot widen scope.
+  hardExclusions Json @default("{}")
+
+  status GrantStatus @default(DRAFT)
+
+  // Revocation state lives ON the grant as the SOURCE of truth, so a licensee's
+  // tooling can answer "is this valid, and if not why" without an AuditLog join.
+  // AuditLog records revocation too — but as the trail, not the source.
+  revokedAt     DateTime?
+  revokedReason String?
+
+  // Amendments SUPERSEDE rather than mutate: mutating an ACTIVE grant would break
+  // the immutability the provenance hash chain asserts. A new version points back
+  // at the one it replaces (1:1 self-relation); LicenseInstances pin a specific
+  // version by referencing its row.
+  supersedesId String? @unique
+  supersedes   Grant?  @relation("GrantVersion", fields: [supersedesId], references: [id], onDelete: Restrict)
+  supersededBy Grant?  @relation("GrantVersion")
+
+  licenses   LicenseInstance[]
+  provenance ProvenanceRecord[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([personId])
+  @@index([licenseeId])
+  @@index([status])
+  @@index([startsAt, endsAt])
+}
+
+/// Join table: Grant ↔ LikenessAsset (many-to-many). Deleting a grant removes its
+/// links; an asset referenced by any grant is Restrict-protected from deletion.
+model GrantAsset {
+  grantId String
+  grant   Grant         @relation(fields: [grantId], references: [id], onDelete: Cascade)
+  assetId String
+  asset   LikenessAsset @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@id([grantId, assetId])
+  @@index([assetId])
+}
+
+/// A Grant exercised by a Licensee. Because each grant version is its own row,
+/// referencing grantId pins the exact version exercised.
+model LicenseInstance {
+  id      String @id @default(cuid())
+  grantId String
+  grant   Grant  @relation(fields: [grantId], references: [id], onDelete: Restrict)
+
+  licenseeId String
+  licensee   Licensee @relation(fields: [licenseeId], references: [id], onDelete: Restrict)
+
+  status      LicenseInstanceStatus @default(PENDING)
+  exercisedAt DateTime              @default(now())
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+
+  provenance ProvenanceRecord[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([grantId])
+  @@index([licenseeId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Provenance & audit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tamper-evident hash-chain entry. Each record commits to the previous record's
+/// hash; `hash` is the commitment over `payload`. prevHash is null only at the
+/// chain genesis. References the Grant and/or LicenseInstance the event concerns.
+model ProvenanceRecord {
+  id       String  @id @default(cuid())
+  prevHash String?
+  hash     String  @unique
+  payload  Json
+
+  grantId String?
+  grant   Grant?  @relation(fields: [grantId], references: [id], onDelete: Restrict)
+
+  licenseInstanceId String?
+  licenseInstance   LicenseInstance? @relation(fields: [licenseInstanceId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@index([grantId])
+  @@index([licenseInstanceId])
+  @@index([prevHash])
+}
+
+/// Append-only audit log. Every grant issuance, scope evaluation, and revocation
+/// writes here. Actor and entity are stored as (type, id) rather than hard FKs so
+/// the log is immutable and survives deletion of the rows it describes — there is
+/// no update or delete path in the service layer.
+model AuditLog {
+  id String @id @default(cuid())
+
+  actorType String // "Person" | "Representative" | "Licensee" | "System"
+  actorId   String?
+
+  action     String // e.g. GRANT_ISSUED, SCOPE_EVALUATED, GRANT_REVOKED
+  entityType String // e.g. "Grant", "LicenseInstance"
+  entityId   String
+
+  before Json?
+  after  Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([actorType, actorId])
+  @@index([createdAt])
+}

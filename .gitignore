@@ -48,3 +48,6 @@ scratch/
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# prisma — generated client (Prisma 7 prisma-client generator output)
+/lib/generated/prisma
